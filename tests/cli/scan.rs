@@ -21,6 +21,7 @@ fn distinguishes_roots_from_the_modules_they_call() {
         report,
         json!({
             "indexed_directories": 2,
+            "unchanged_directories": 0,
             "repositories": 1,
             "confirmed_roots": 1,
             "probable_roots": 0,

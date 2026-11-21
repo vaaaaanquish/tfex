@@ -2,6 +2,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::time::{Duration, SystemTime};
 use std::{env, fs, iter};
 
 use assert_cmd::cargo::cargo_bin_cmd;
@@ -41,10 +42,27 @@ impl Workspace {
     }
 
     /// Write a file, creating its parent directories.
+    ///
+    /// The file is given a modification time in the past, as if it had been
+    /// written a while ago: a scan does not rely on the modification time of
+    /// a file that was only just written, which would make what it leaves
+    /// unread depend on how fast the test runs.
     pub(crate) fn write(&self, relative: &str, contents: &str) {
         let path = self.path(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, contents).unwrap();
+        fs::write(&path, contents).unwrap();
+        set_modified(&path, SystemTime::now() - Duration::from_secs(3600));
+    }
+
+    /// Replace the contents of a file with others of the same length without
+    /// touching its modification time, which a scan cannot tell from the
+    /// file being left alone.
+    pub(crate) fn overwrite_unnoticed(&self, relative: &str, contents: &str) {
+        let path = self.path(relative);
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len(), contents.len() as u64, "{relative}");
+        fs::write(&path, contents).unwrap();
+        set_modified(&path, metadata.modified().unwrap());
     }
 
     pub(crate) fn remove_directory(&self, relative: &str) {
@@ -158,6 +176,39 @@ fi
         calls
     }
 
+    /// Install a stand-in for `terraform` that prints, instead of planning,
+    /// the file `fake-plan.jsonl` of the directory it is run in, or
+    /// `fake-refresh.jsonl` when asked for a refresh-only plan.
+    ///
+    /// It fails after printing when the directory has a file `fake-failure`,
+    /// and hangs when it has a file `fake-slow`. Every invocation is appended
+    /// to `terraform-calls.log` as `<directory>|<TF_WORKSPACE>|<arguments>`.
+    pub(crate) fn fake_terraform(&self) {
+        let script = r#"#!/bin/sh
+echo "$PWD|$TF_WORKSPACE|$*" >> "$(dirname "$0")/../terraform-calls.log"
+output=fake-plan.jsonl
+for argument in "$@"; do
+  if [ "$argument" = "-refresh-only" ]; then output=fake-refresh.jsonl; fi
+done
+if [ -f fake-slow ]; then exec sleep 30; fi
+if [ -f "$output" ]; then cat "$output"; fi
+if [ -f fake-failure ]; then
+  cat fake-failure >&2
+  exit 1
+fi
+"#;
+        let path = self.path("bin/terraform");
+        self.write("bin/terraform", script);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The invocations of the stand-in installed by
+    /// [`Workspace::fake_terraform`], in order.
+    pub(crate) fn terraform_calls(&self) -> Vec<String> {
+        let log = fs::read_to_string(self.path("terraform-calls.log")).unwrap_or_default();
+        log.lines().map(str::to_owned).collect()
+    }
+
     /// The ID of the only non-module root at `relative_path`.
     pub(crate) fn root_id(&self, relative_path: &str) -> String {
         let roots = self.tfex(&["roots", "--all"]);
@@ -175,6 +226,11 @@ fi
     pub(crate) fn index_contents(&self) -> String {
         String::from_utf8_lossy(&fs::read(&self.index).unwrap()).into_owned()
     }
+}
+
+fn set_modified(path: &Utf8Path, time: SystemTime) {
+    let file = fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(time).unwrap();
 }
 
 /// A repository named `infra` with one root and the module it calls:

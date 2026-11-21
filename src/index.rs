@@ -11,7 +11,10 @@ use std::fs;
 use camino::{Utf8Path, Utf8PathBuf};
 use rusqlite::Connection;
 
-pub(crate) use self::read::{ModuleCallRow, ResourceRow, StateRow, StateTarget};
+pub(crate) use self::read::{
+    Direction, KnownDirectory, ModuleCallRow, ModuleEdge, PlanRow, ReferenceRow, RelatedAddress,
+    RelatedDirectory, ResourceRow, RootRow, StateRow, StateTarget,
+};
 pub(crate) use self::write::{NewRoot, Writer};
 use crate::error::{Error, Result};
 use crate::paths;
@@ -19,7 +22,7 @@ use crate::paths;
 const SCHEMA: &str = include_str!("index/schema.sql");
 
 /// Version of [`SCHEMA`], stored in the database's `user_version`.
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 
 /// Backend type recorded for a directory that declares no backend.
 const UNKNOWN_BACKEND: &str = "unknown";

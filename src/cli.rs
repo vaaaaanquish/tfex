@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::index::Index;
+use crate::plan::{self, Mode};
 use crate::{commands, fetch, scan};
 
 const DB_HELP: &str = "SQLite index file [default: $XDG_DATA_HOME/tfex/index.sqlite3]";
@@ -37,6 +38,10 @@ enum Command {
         /// Directories to scan recursively
         #[arg(required = true, value_name = "PATH")]
         paths: Vec<Utf8PathBuf>,
+
+        /// Read every directory again, even those whose files look unchanged
+        #[arg(long)]
+        full: bool,
     },
 
     /// List the discovered roots
@@ -73,6 +78,28 @@ enum Command {
         limit: u32,
     },
 
+    /// Show module calls between directories, and references inside one
+    ///
+    /// Without a root: every module call in the index, with the directory
+    /// it resolves to. With a root: its module calls, the directories it
+    /// depends on and that depend on it, and the references between its
+    /// declarations.
+    Graph {
+        #[arg(help = ROOT_HELP)]
+        root: Option<String>,
+    },
+
+    /// Show what a declaration of a root depends on, and what depends on it
+    Deps {
+        #[arg(help = ROOT_HELP)]
+        root: String,
+
+        /// A resource (`aws_vpc.main`), data source (`data.x.y`), module call
+        /// (`module.x`), local value (`local.x`), variable (`var.x`) or
+        /// output (`output.x`)
+        address: String,
+    },
+
     /// Show state availability and freshness, for one root or for all
     Status {
         #[arg(help = ROOT_HELP)]
@@ -81,9 +108,9 @@ enum Command {
 
     /// Read each state from where it is, remote backends included
     ///
-    /// This is the only command that uses the network. Remote states are
-    /// read with the gcloud and aws command-line tools and the credentials
-    /// they are already set up with. Only metadata is kept.
+    /// Apart from `plan`, this is the only command that uses the network.
+    /// Remote states are read with the gcloud and aws command-line tools and
+    /// the credentials they are already set up with. Only metadata is kept.
     Fetch {
         /// Roots whose states to read [default: every root]
         #[arg(value_name = "ROOT")]
@@ -92,6 +119,40 @@ enum Command {
         /// Seconds to wait for each state
         #[arg(long, default_value_t = 60, value_name = "SECONDS")]
         timeout: u64,
+    },
+
+    /// Run `terraform plan` in roots and report what would change
+    ///
+    /// This is the only command that runs Terraform, with whatever
+    /// credentials it finds. The roots must already be initialized: tfex
+    /// does not run `terraform init`. The state is not locked and no plan
+    /// file is saved. Only addresses, actions and counts are kept.
+    Plan {
+        /// Roots to plan
+        #[arg(required = true, value_name = "ROOT")]
+        roots: Vec<String>,
+
+        /// Detect drift: report what changed outside Terraform since the
+        /// state was written, instead of what the configuration would change
+        #[arg(long)]
+        refresh_only: bool,
+
+        /// The workspace to plan [default: the one selected in the root]
+        #[arg(long, env = "TF_WORKSPACE", value_name = "NAME")]
+        workspace: Option<String>,
+
+        /// Seconds to wait for each plan
+        #[arg(long, default_value_t = 600, value_name = "SECONDS")]
+        timeout: u64,
+
+        /// The program to run, such as `tofu` or a path to a terraform binary
+        #[arg(
+            long,
+            env = "TFEX_TERRAFORM",
+            default_value = "terraform",
+            value_name = "PROGRAM"
+        )]
+        terraform: String,
     },
 
     /// Declare where the state of a workspace of a root is
@@ -138,11 +199,14 @@ fn run(arguments: Arguments) -> Result<()> {
     let location = Index::locate(arguments.db.as_deref())?;
     let mut index = Index::open(&location)?;
     match arguments.command {
-        Command::Scan { paths } => print(&scan::scan(&mut index, &paths)?),
+        Command::Scan { paths, full } => print(&scan::scan(&mut index, &paths, full)?),
         Command::Roots { all } => print(&index.roots(all)?),
         Command::Search { query, limit } => print(&index.search(&query, limit)?),
         Command::Inspect { root } => print(&commands::inspect(&index, &root)?),
         Command::Log { root, limit } => print(&commands::log(&index, &root, limit)?),
+        Command::Graph { root: Some(root) } => print(&commands::graph(&index, &root)?),
+        Command::Graph { root: None } => print(&index.module_edges(None)?),
+        Command::Deps { root, address } => print(&commands::dependencies(&index, &root, &address)?),
         Command::Status { root: Some(root) } => print(&commands::status(&index, &root)?),
         Command::Status { root: None } => print(&index.state_overview()?),
         Command::Fetch { roots, timeout } => print(&fetch::fetch(
@@ -150,6 +214,25 @@ fn run(arguments: Arguments) -> Result<()> {
             &roots,
             Duration::from_secs(timeout),
         )?),
+        Command::Plan {
+            roots,
+            refresh_only,
+            workspace,
+            timeout,
+            terraform,
+        } => {
+            let options = plan::Options {
+                mode: if refresh_only {
+                    Mode::RefreshOnly
+                } else {
+                    Mode::Plan
+                },
+                program: terraform,
+                workspace: workspace.filter(|workspace| !workspace.is_empty()),
+                timeout: Duration::from_secs(timeout),
+            };
+            print(&plan::plan(&mut index, &roots, &options)?)
+        }
         Command::MapState {
             root,
             location,

@@ -75,7 +75,7 @@ impl FromSql for RootId {
 }
 
 /// First `length` hexadecimal digits of the SHA-256 of `input`.
-fn sha256_prefix(input: &str, length: usize) -> String {
+pub(crate) fn sha256_prefix(input: &str, length: usize) -> String {
     let mut hex = String::with_capacity(Sha256::output_size() * 2);
     for byte in Sha256::digest(input.as_bytes()) {
         // Writing to a `String` cannot fail.

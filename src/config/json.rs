@@ -4,7 +4,10 @@
 
 use serde_json::{Map, Value};
 
-use super::{Backend, Configuration, ModuleCall, Resource, ResourceKind, is_safe_backend_setting};
+use super::{
+    Backend, Configuration, LineIndex, ModuleCall, Resource, ResourceKind, is_safe_backend_setting,
+    references,
+};
 
 type Object = Map<String, Value>;
 
@@ -18,28 +21,45 @@ pub(super) fn read(text: &str, file: &str, configuration: &mut Configuration) {
     let Ok(Value::Object(root)) = serde_json::from_str(text) else {
         return;
     };
+    // Every offset is on the first line of an empty text.
+    let lines = LineIndex::new("");
+    let refer = |configuration: &mut Configuration, from: &str, arguments: &Value| {
+        let mut candidates = Vec::new();
+        collect_references(arguments, false, &mut candidates);
+        configuration.refer(from, candidates, file, &lines);
+    };
+
     for (key, kind) in [
         ("resource", ResourceKind::Managed),
         ("data", ResourceKind::Data),
     ] {
         for (type_name, names) in entries(root.get(key)) {
-            for (name, _) in entries(Some(names)) {
-                configuration
-                    .resources
-                    .push(Resource::new(kind, type_name, name, file, LINE));
+            for (name, arguments) in entries(Some(names)) {
+                let resource = Resource::new(kind, type_name, name, file, LINE);
+                refer(configuration, &resource.address(), arguments);
+                configuration.resources.push(resource);
             }
         }
     }
     for (name, arguments) in entries(root.get("module")) {
-        configuration.module_calls.push(ModuleCall {
-            name: name.clone(),
-            source: objects(Some(arguments))
-                .find_map(|arguments| arguments.get("source"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            file: file.to_owned(),
-            line: LINE,
-        });
+        let source = objects(Some(arguments))
+            .find_map(|arguments| arguments.get("source"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let call = ModuleCall::new(name, source, file, LINE);
+        refer(configuration, &call.address(), arguments);
+        configuration.module_calls.push(call);
+    }
+    for (name, arguments) in entries(root.get("output")) {
+        refer(configuration, &format!("output.{name}"), arguments);
+    }
+    for (name, value) in entries(root.get("locals")) {
+        let address = format!("local.{name}");
+        refer(configuration, &address, value);
+        configuration.named_values.insert(address);
+    }
+    for (name, _) in entries(root.get("variable")) {
+        configuration.named_values.insert(format!("var.{name}"));
     }
     if entries(root.get("provider")).next().is_some() {
         configuration.has_provider = true;
@@ -74,6 +94,26 @@ fn objects(value: Option<&Value>) -> impl Iterator<Item = &Object> {
 /// The key/value pairs of every object at a block position.
 fn entries(value: Option<&Value>) -> impl Iterator<Item = (&String, &Value)> {
     objects(value).flatten()
+}
+
+/// The candidate references in the strings anywhere inside `value`. A string
+/// is a template, except under `depends_on`, where it is a bare reference.
+fn collect_references(value: &Value, is_bare: bool, candidates: &mut Vec<references::Candidate>) {
+    match value {
+        Value::String(text) if is_bare => candidates.extend(references::in_json_reference(text)),
+        Value::String(text) => candidates.extend(references::in_json_string(text)),
+        Value::Array(items) => {
+            for item in items {
+                collect_references(item, is_bare, candidates);
+            }
+        }
+        Value::Object(object) => {
+            for (key, item) in object {
+                collect_references(item, key == "depends_on", candidates);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 fn is_scalar(value: &Value) -> bool {
@@ -162,6 +202,42 @@ mod tests {
         assert_eq!(
             json!(configuration.backend.unwrap().settings),
             json!({"bucket": "state"})
+        );
+    }
+
+    #[test]
+    fn collects_candidate_references() {
+        let configuration = parse(
+            r#"{
+  "variable": {"cidr": {}},
+  "locals": {"name": "net-${var.cidr}"},
+  "resource": {"aws_vpc": {"main": {"cidr_block": "${var.cidr}", "tags": {"Name": "${local.name}"}}}},
+  "module": {"app": {"source": "./app", "vpc": "${aws_vpc.main.id}", "depends_on": ["aws_vpc.main"]}},
+  "output": {"app": {"value": "${module.app.url}", "description": "not.a.reference"}}
+}"#,
+        );
+        let mut references: Vec<(&str, &str)> = configuration
+            .references
+            .iter()
+            .map(|reference| (reference.from.as_str(), reference.to.as_str()))
+            .collect();
+        references.sort_unstable();
+        assert_eq!(
+            references,
+            [
+                ("aws_vpc.main", "local.name"),
+                ("aws_vpc.main", "var.cidr"),
+                ("local.name", "var.cidr"),
+                ("module.app", "aws_vpc.main"),
+                ("module.app", "aws_vpc.main"),
+                ("output.app", "module.app"),
+            ]
+        );
+        assert!(
+            configuration
+                .references
+                .iter()
+                .all(|reference| reference.line == LINE)
         );
     }
 

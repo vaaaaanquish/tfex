@@ -2,8 +2,8 @@
 //!
 //! A file with a syntax error should still be searchable, so its top-level
 //! blocks are found with regular expressions after comments are masked. This
-//! understands quoted strings but neither heredocs nor nesting, which is why
-//! it is only the fallback.
+//! understands quoted strings but neither heredocs nor nesting, and finds no
+//! references between declarations, which is why it is only the fallback.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -57,12 +57,12 @@ pub(super) fn read(text: &str, file: &str, configuration: &mut Configuration) {
                 line,
             )),
             ("provider", _) => configuration.has_provider = true,
-            ("module", _) => configuration.module_calls.push(ModuleCall {
-                name: first_label.to_owned(),
-                source: string_arguments(&masked, opening_brace).remove("source"),
-                file: file.to_owned(),
+            ("module", _) => configuration.module_calls.push(ModuleCall::new(
+                first_label,
+                string_arguments(&masked, opening_brace).remove("source"),
+                file,
                 line,
-            }),
+            )),
             _ => {}
         }
     }
@@ -223,12 +223,12 @@ provider "google" {
         );
         assert_eq!(
             configuration.module_calls,
-            [ModuleCall {
-                name: "network".to_owned(),
-                source: Some("./modules/network".to_owned()),
-                file: "main.tf".to_owned(),
-                line: 5,
-            }]
+            [ModuleCall::new(
+                "network",
+                Some("./modules/network".to_owned()),
+                "main.tf",
+                5
+            )]
         );
         assert!(configuration.has_provider);
         let backend = configuration.backend.unwrap();

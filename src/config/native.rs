@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use super::{
     Backend, Configuration, LineIndex, ModuleCall, Resource, ResourceKind, is_safe_backend_setting,
+    references,
 };
 
 /// Add the declarations in `text` to `configuration`.
@@ -30,33 +31,58 @@ pub(super) fn read(
     for block in body.blocks() {
         let labels = labels_of(block);
         let line = lines.line_at(offset_of(block));
-        match (block.ident.as_str(), labels.as_slice()) {
-            ("resource", [type_name, name]) => configuration.resources.push(Resource::new(
-                ResourceKind::Managed,
-                type_name,
-                name,
-                file,
-                line,
-            )),
-            ("data", [type_name, name]) => configuration.resources.push(Resource::new(
-                ResourceKind::Data,
-                type_name,
-                name,
-                file,
-                line,
-            )),
-            ("provider", [_]) => configuration.has_provider = true,
-            ("module", [name]) => configuration.module_calls.push(ModuleCall {
-                name: (*name).to_owned(),
-                source: block
+        // The address of what the block declares, when it can refer to
+        // other declarations.
+        let declared = match (block.ident.as_str(), labels.as_slice()) {
+            ("resource", [type_name, name]) => {
+                let resource = Resource::new(ResourceKind::Managed, type_name, name, file, line);
+                let address = resource.address();
+                configuration.resources.push(resource);
+                Some(address)
+            }
+            ("data", [type_name, name]) => {
+                let resource = Resource::new(ResourceKind::Data, type_name, name, file, line);
+                let address = resource.address();
+                configuration.resources.push(resource);
+                Some(address)
+            }
+            ("module", [name]) => {
+                let source = block
                     .body
                     .get_attribute("source")
-                    .and_then(|attribute| string_value(&attribute.value, text)),
-                file: file.to_owned(),
-                line,
-            }),
-            ("terraform", []) if backend.is_none() => backend = declared_backend(&block.body, text),
-            _ => {}
+                    .and_then(|attribute| string_value(&attribute.value, text));
+                let call = ModuleCall::new(name, source, file, line);
+                let address = call.address();
+                configuration.module_calls.push(call);
+                Some(address)
+            }
+            ("output", [name]) => Some(format!("output.{name}")),
+            ("variable", [name]) => {
+                configuration.named_values.insert(format!("var.{name}"));
+                None
+            }
+            ("locals", []) => {
+                // Each local value is a declaration of its own.
+                for attribute in block.body.attributes() {
+                    let address = format!("local.{}", attribute.key.as_str());
+                    let candidates = references::in_expression(&attribute.value);
+                    configuration.refer(&address, candidates, file, &lines);
+                    configuration.named_values.insert(address);
+                }
+                None
+            }
+            ("provider", [_]) => {
+                configuration.has_provider = true;
+                None
+            }
+            ("terraform", []) if backend.is_none() => {
+                backend = declared_backend(&block.body, text);
+                None
+            }
+            _ => None,
+        };
+        if let Some(address) = declared {
+            configuration.refer(&address, references::in_body(&block.body), file, &lines);
         }
     }
     if backend.is_some() {
@@ -194,12 +220,12 @@ module "network" {
         assert!(configuration.has_provider);
         assert_eq!(
             configuration.module_calls,
-            [ModuleCall {
-                name: "network".to_owned(),
-                source: Some("../../modules/network".to_owned()),
-                file: "main.tf".to_owned(),
-                line: 10,
-            }]
+            [ModuleCall::new(
+                "network",
+                Some("../../modules/network".to_owned()),
+                "main.tf",
+                10
+            )]
         );
     }
 
@@ -336,6 +362,81 @@ resource "null_resource" "after" {}
     fn module_source_must_be_a_literal() {
         let configuration = parse("module \"dynamic\" {\n  source = local.source\n}\n");
         assert_eq!(configuration.module_calls[0].source, None);
+    }
+
+    fn references(configuration: &Configuration) -> Vec<(&str, &str, usize)> {
+        configuration
+            .references
+            .iter()
+            .map(|reference| {
+                (
+                    reference.from.as_str(),
+                    reference.to.as_str(),
+                    reference.line,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collects_candidate_references_of_every_declaration() {
+        let configuration = parse(
+            r#"variable "cidr" {
+  validation {
+    condition = can(cidrhost(var.cidr, 0))
+  }
+}
+
+locals {
+  name = "net-${var.cidr}"
+}
+
+resource "aws_vpc" "main" {
+  cidr_block = var.cidr
+  tags       = { Name = local.name }
+}
+
+data "aws_subnets" "all" {
+  filter {
+    values = [aws_vpc.main.id]
+  }
+}
+
+module "app" {
+  source     = "./app"
+  subnets    = data.aws_subnets.all.ids
+  depends_on = [aws_vpc.main]
+}
+
+output "app" {
+  value = module.app.url
+}
+
+provider "aws" {
+  region = var.region
+}
+"#,
+        );
+        // Variables and providers are not declarations that refer to others.
+        assert_eq!(
+            references(&configuration),
+            [
+                ("local.name", "var.cidr", 8),
+                ("aws_vpc.main", "var.cidr", 12),
+                ("aws_vpc.main", "local.name", 13),
+                ("data.aws_subnets.all", "aws_vpc.main", 18),
+                ("module.app", "data.aws_subnets.all", 24),
+                ("module.app", "aws_vpc.main", 25),
+                ("output.app", "module.app", 29),
+            ]
+        );
+        let mut named_values: Vec<&str> = configuration
+            .named_values
+            .iter()
+            .map(String::as_str)
+            .collect();
+        named_values.sort_unstable();
+        assert_eq!(named_values, ["local.name", "var.cidr"]);
     }
 
     #[test]

@@ -4,26 +4,28 @@
 
 Give coding agents lightweight, trustworthy context about infrastructure code
 that is spread over many directories and Git repositories: what is declared
-where, which directories are roots, what is known about their state, and what
-changed recently.
+where, which directories are roots, what is known about their state, what
+depends on what, what changed recently, and (when asked) what Terraform would
+change.
 
 tfex is not an orchestrator, a deployment system, a replacement for Terraform
 or Terragrunt, a live cloud inventory, or a source of truth for deployments.
 
 ## Principles
 
-- **Read-only.** tfex reads files and runs read-only Git commands. It never
-  runs `terraform init`, `plan`, `apply` or `refresh`, and writes only to its
-  own index.
+- **Read-only.** tfex reads files and runs read-only Git commands, and writes
+  only to its own index. It never runs `terraform init`, `apply` or
+  `refresh`. `terraform plan` is run by one explicitly named command, `plan`,
+  without locking the state and without saving a plan.
 - **Offline unless asked.** `scan` and every query work from the local disk.
-  The network is used by one explicitly named command, `fetch`, and only to
-  download state objects.
+  The network is used by two explicitly named commands: `fetch`, to download
+  state objects, and `plan`, through Terraform. Nothing else starts either.
 - **No credentials of its own.** Remote stores are read through the vendors'
   command-line tools and whatever the user has signed them in with.
 - **Never trust a state file with secrets.** A state can hold credentials in
   plain text whether or not Terraform marks them sensitive, so only metadata
   is ever read out of one. This is enforced where the file is parsed, not
-  where it is printed.
+  where it is printed. The same goes for a plan.
 - **Say what is not known.** A remote state that was not fetched is
   `unresolved`, not absent and not available. A directory that owns a state is
   `confirmed`, which is not the same as deployed. A file that could not be
@@ -44,13 +46,14 @@ A single binary crate. Each module knows about one thing:
 | `cli` | Arguments, dispatch, JSON on stdout, failures on stderr. Nothing else knows the command line exists. |
 | `scan` | The `scan` command: the pipeline below. |
 | `fetch` | The `fetch` command: read every located state, in parallel. |
-| `commands` | `inspect`, `log`, `status`, `map-state`. |
+| `plan` | The `plan` command: run `terraform plan` and summarize what it says. The only place Terraform is run. |
+| `commands` | `inspect`, `log`, `status`, `graph`, `deps`, `map-state`. |
 | `discovery` | Walk directory trees; classify a directory from the evidence. |
-| `config` | What the configuration files of one directory declare. `native` (HCL parser), `json` (`.tf.json`), `heuristic` (fallback). |
+| `config` | What the configuration files of one directory declare, and their fingerprint. `native` (HCL parser), `json` (`.tf.json`), `heuristic` (fallback), `references` (which declarations an expression mentions). |
 | `state` | Where the state of each workspace is, and the metadata kept about a state. |
-| `remote` | Reading a state object from `gcs` or `s3`. The only network access. |
+| `remote` | Reading a state object from `gcs` or `s3`. The only network access tfex makes itself. |
 | `git` | Repository identity and history through the `git` command. |
-| `process` | Running `git`, `gcloud` and `aws` with a time limit. |
+| `process` | Running `git`, `gcloud`, `aws` and `terraform` with a time limit. |
 | `index` | The SQLite index: schema, `write` (one transaction per command), `read` (the row types the commands print). |
 | `identity`, `paths`, `time`, `error` | Shared vocabulary. |
 
@@ -62,7 +65,9 @@ A single binary crate. Each module knows about one thing:
    checkout, in parallel; a directory outside Git belongs to the innermost
    scanned path.
 3. **Select** one checkout per repository (see [Identity](#identity)).
-4. **Read** the configuration of each selected directory, in parallel.
+4. **Read** the configuration of each selected directory, in parallel,
+   unless its fingerprint says it is as the index has it (see
+   [Incremental scans](#incremental-scans)).
 5. **Classify** each directory, now that it is known which directories are
    called as local modules.
 6. **Write** everything in one transaction, then prune the directories that
@@ -70,6 +75,43 @@ A single binary crate. Each module knows about one thing:
 
 Steps 1, 2 and 4 are where the time goes, and are the parallel ones. The
 rest is sequential and ordered by path, which keeps a scan deterministic.
+
+### Incremental scans
+
+Parsing and rewriting the rows of a directory is most of the work of a scan,
+and almost always produces what is already in the index. So each directory
+is recorded with a fingerprint: a digest of the name, size and modification
+time of every configuration file directly inside it, and of the tfex version
+(what is extracted from a file depends on the code extracting it). A scan
+that finds the same fingerprint, at the same path, leaves the directory
+unread and its resources, module calls and references untouched.
+
+The walk itself is not skipped: it is how new and deleted directories are
+found, and the fingerprint needs a `stat` of each file anyway. Git tree
+hashes would avoid even that, but only for clean checkouts of committed
+files, and tfex also indexes folders outside Git and uncommitted work.
+
+Three things keep this from making the index wrong:
+
+- **What depends on other directories or on other files is recomputed.**
+  The classification of a directory depends on who calls it, and its states
+  on files that are not configuration. Both are worked out by every scan
+  from an *outline* of the configuration (backend, whether a provider is
+  configured, whether anything is declared, which local modules are
+  called), which is exactly what the index can give back for an unchanged
+  directory.
+- **Modification times are not trusted when they are fresh.** A file written
+  twice within the resolution of the file system's timestamps keeps its
+  time. A directory with a file modified in the last two seconds gets no
+  fingerprint, and is read again by the next scan. The fingerprint is taken
+  before the files are read, so a write racing with the scan is caught by
+  the next one too.
+- **Whatever must be reported again is read again.** A directory with a
+  file the parser rejected gets no fingerprint, so `parse_fallbacks` keeps
+  listing it until it is fixed.
+
+What is left is a change that preserves both size and modification time,
+which `scan --full` is for.
 
 ## Identity
 
@@ -97,6 +139,8 @@ keeps source positions. Only top-level blocks are looked at:
 
 - `resource` and `data` blocks become resources;
 - `module` blocks become module calls, with `source` when it is a literal;
+- `variable` blocks and the attributes of `locals` blocks are noted as
+  things that can be referred to, and `output` blocks as things that refer;
 - a `provider` block is a sign of a root;
 - `backend` and `cloud` blocks inside `terraform` give the backend.
 
@@ -114,6 +158,75 @@ objects wherever a block may appear, and so does tfex.
 Backend settings are filtered through an allowlist of the settings that
 locate a state (`bucket`, `key`, `prefix`, `path`, ...). Anything else is
 dropped while reading.
+
+## Dependency graph
+
+There are two graphs, and neither needs Terraform to build.
+
+**Module calls** connect directories. A call with a local `source` records
+the canonical path it points at; queries join that path with the paths of
+the indexed directories. Storing the path rather than the ID of the target
+means the edge appears as soon as the target is indexed, by whichever scan,
+and disappears with it. Reachability in either direction ("what does this
+root pull in", "which roots use this module") is a recursive query.
+
+**References** connect the declarations of one directory. Expressions are
+walked with the parser's visitor, and every traversal shaped like a
+reference (`<type>.<name>`, `data.<type>.<name>`, `module.<name>`,
+`var.<name>`, `local.<name>`) is a candidate, wherever it is: arguments,
+nested and `dynamic` blocks, templates, `depends_on`. A candidate is kept
+only if it names something the directory declares. That one rule is what
+discards `each.value`, `count.index`, `self.id`, `path.module`, iterator
+variables of `for` expressions and `dynamic` blocks, and references to
+things that do not exist, without tfex having to model Terraform's scopes.
+The price is a false edge when a `for` variable is named like a resource
+type and reads an attribute named like a resource, which nobody writes.
+
+Each pair is stored once, at its first occurrence. In `.tf.json` files every
+string is parsed as a template, and the items of `depends_on` as bare
+references.
+
+References stop at module boundaries: `module.app.address` depends on
+`module.app`, and what `address` is made of is in another directory, under
+other addresses. Joining the two is left for later.
+
+Both recursive queries stop after 64 steps. Terraform rejects cycles, but
+tfex reads configurations Terraform never validated.
+
+## Plans
+
+`tfex plan` runs `terraform plan -json -input=false -lock=false` (plus
+`-refresh-only` for a drift check) in the directory of each selected root,
+side by side, each with a time limit.
+
+- **Opt-in, per root.** There is no "plan everything": roots must be named.
+  No other command starts Terraform.
+- **No init.** `terraform init` downloads providers and modules and writes
+  `.terraform`; that is a decision for the user. An uninitialized root
+  fails with Terraform's own message.
+- **No lock, no plan file.** Since Terraform refreshes in memory while
+  planning, a plan without `-out` writes neither state nor plan, so there
+  is nothing a lock would protect, and holding one would make a concurrent
+  apply fail. Not saving the plan also keeps its values off the disk.
+- **The streaming JSON output, not the plan.** `terraform show -json` on a
+  saved plan carries every value, before and after. The machine-readable
+  UI output names each change (`planned_change`, `resource_drift`) by
+  address and action and summarizes the counts (`change_summary`), which
+  is all tfex wants. It is deserialized into types that have only those
+  fields. Of a diagnostic, only the severity and the one-line summary are
+  read: the detail and the source snippet can quote values.
+- **A failure is an outcome.** No `terraform`, no credentials, a timeout, an
+  error diagnostic: each is `status: error` on that plan, recorded like any
+  other outcome, and the command succeeds.
+
+The workspace a plan is about is the one given with `--workspace` (passed
+on as `TF_WORKSPACE`), or the one Terraform has selected in the directory
+(`.terraform/environment`), or `default`.
+
+The index keeps a summary of the last plan of each kind per workspace:
+status, counts, when. It is a record of something that happened, not a
+cache, so rescans keep it, and `planned_at` is there to judge it by. The
+list of changed addresses is printed but not stored.
 
 ## State
 
@@ -163,8 +276,9 @@ because that text can quote the offending value.
 One SQLite file, bundled SQLite, `STRICT` tables, foreign keys with
 `ON DELETE CASCADE`. The schema version is stored in `user_version`; a file
 with any other version, or one that tfex did not create, is refused rather
-than migrated. The index is a cache of what a scan can rebuild, with one
-exception: `state_mappings` holds what the user declared.
+than migrated. The index is a cache of what a scan can rebuild, with two
+exceptions: `state_mappings` holds what the user declared, and `plans` what
+Terraform said the last time it was asked.
 
 ## Roads not taken (yet)
 
@@ -175,12 +289,15 @@ exception: `state_mappings` holds what the user declared.
 - **Joining configuration and state.** Expanded instance addresses
   (`count`, `for_each`), `moved` blocks, resources in state but not in code
   and the reverse.
-- **Dependency graph.** Module ownership and references between resources.
-- **Incremental indexing.** Rescan only what changed, keyed by file
-  modification time or Git tree hashes.
+- **References across module boundaries.** Connecting `module.x.<output>`
+  in a caller to `output.<output>` in the module, and the arguments of a
+  call to the module's variables.
+- **Skipping the walk.** Using Git tree hashes to leave whole unchanged
+  checkouts unvisited.
+- **Keeping the changes of a plan**, to answer "what drifted last night"
+  offline, and passing `-var-file` or `-target` through.
 - **Full-text search** with SQLite FTS5, beyond substring search over
   addresses and types.
-- **Drift.** `terraform plan -refresh-only` as an opt-in, never implicit.
 - **An MCP server** exposing the same read-only queries.
 
 ## Verification criteria
@@ -202,3 +319,13 @@ These are covered by the test suite:
   on that state, not a failed command.
 - Several checkouts of one repository yield one set of roots.
 - Rescanning prunes what is gone and keeps what was not rescanned.
+- A rescan leaves unchanged directories unread, and still notices a changed
+  file, a new caller, a new state, a moved checkout and a syntax error.
+- Module calls resolve to indexed directories, whichever scan indexed them,
+  and are followed in both directions.
+- Only references to what a directory declares are kept; cycles end.
+- Terraform is run by `plan` and by nothing else, with arguments that
+  neither lock nor write.
+- Plan values and diagnostic details never reach the index or the output.
+- A plan Terraform cannot make (not initialized, no program, timeout) is an
+  error on that plan, not a failed command.

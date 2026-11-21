@@ -8,13 +8,14 @@
 //! The crate is organized by what each module knows about:
 //!
 //! - [`cli`]: the command line, and nothing below it knows it exists.
-//! - [`scan`], [`fetch`] and [`commands`]: one function per command.
+//! - [`scan`], [`fetch`], [`plan`] and [`commands`]: one function per command.
 //! - [`discovery`]: which directories hold Terraform, and which are roots.
 //! - [`config`]: what a directory's configuration files declare.
 //! - [`state`]: where states are, and the metadata kept about them.
-//! - [`remote`]: reading states from remote stores; the only network access.
+//! - [`remote`]: reading states from remote stores; the only network access
+//!   tfex makes itself.
 //! - [`git`]: repository identity and history, through the `git` command.
-//! - [`process`]: running those external tools with a time limit.
+//! - [`process`]: running external tools with a time limit.
 //! - [`index`]: the `SQLite` index, the only thing tfex writes.
 //! - [`identity`], [`paths`], [`time`], [`error`]: shared vocabulary.
 
@@ -28,6 +29,7 @@ mod git;
 mod identity;
 mod index;
 mod paths;
+mod plan;
 mod process;
 mod remote;
 mod scan;

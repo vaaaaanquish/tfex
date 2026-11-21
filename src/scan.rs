@@ -2,6 +2,9 @@
 //!
 //! A scan reads files and runs read-only Git commands. It never runs
 //! Terraform, contacts a remote, or writes anywhere but the index.
+//!
+//! A directory whose configuration files are as the previous scan found them
+//! is not read again: what the index holds about it is kept.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -10,12 +13,12 @@ use camino::{Utf8Path, Utf8PathBuf};
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::config::{self, Backend, Configuration, ParseFallback};
+use crate::config::{self, Backend, Configuration, Outline, ParseFallback};
 use crate::discovery::{self, Classification};
 use crate::error::{Error, Result};
 use crate::git::{self, Repository};
 use crate::identity::{RepoKey, RootId};
-use crate::index::{Index, NewRoot, Writer};
+use crate::index::{Index, KnownDirectory, NewRoot, Writer};
 use crate::state::{self, StateLocation};
 use crate::{paths, time};
 
@@ -24,6 +27,9 @@ use crate::{paths, time};
 pub(crate) struct ScanReport {
     /// Directories containing Terraform configuration, modules included.
     pub(crate) indexed_directories: usize,
+    /// How many of them were not read again, because their configuration
+    /// files are as the previous scan found them.
+    pub(crate) unchanged_directories: usize,
     pub(crate) repositories: usize,
     pub(crate) confirmed_roots: usize,
     pub(crate) probable_roots: usize,
@@ -51,19 +57,31 @@ impl ScanReport {
 
 /// Index every Terraform directory under `paths`, replacing what the index
 /// held for those paths.
-pub(crate) fn scan(index: &mut Index, paths: &[Utf8PathBuf]) -> Result<ScanReport> {
+///
+/// With `full`, every directory is read again, whether or not its files
+/// look unchanged.
+pub(crate) fn scan(index: &mut Index, paths: &[Utf8PathBuf], full: bool) -> Result<ScanReport> {
     let bases = resolve_bases(paths)?;
     let directories = discovery::terraform_directories(&bases);
     let repositories =
         git::repositories_of(&directories, |directory| enclosing_base(&bases, directory));
     let selection = Selection::of(&repositories);
-    let configurations = read_configurations(&selection.directories);
-    let local_modules = local_modules(&selection.directories, &configurations);
+    let known = if full {
+        HashMap::new()
+    } else {
+        index.known_directories()?
+    };
+    let directories = read_directories(&selection.directories, &known);
+    let local_modules: HashSet<&Utf8Path> = directories
+        .iter()
+        .flat_map(|directory| &directory.outline.local_modules)
+        .map(Utf8PathBuf::as_path)
+        .collect();
     let indexed_at = time::now();
 
     let mut indexed_roots = HashSet::new();
     let mut report = ScanReport {
-        indexed_directories: selection.directories.len(),
+        indexed_directories: directories.len(),
         repositories: selection.repositories.len(),
         duplicate_checkouts: selection.duplicate_checkouts,
         ..ScanReport::default()
@@ -73,32 +91,34 @@ pub(crate) fn scan(index: &mut Index, paths: &[Utf8PathBuf]) -> Result<ScanRepor
     for repository in &selection.repositories {
         writer.put_repository(repository, &indexed_at)?;
     }
-    for ((directory, repository), configuration) in
-        selection.directories.iter().zip(&configurations)
-    {
-        let relative_path =
-            paths::relative_to(directory, &repository.checkout).unwrap_or_else(|| ".".to_owned());
-        let id = RootId::derive(&repository.key, &relative_path);
-        let evidence = discovery::classify(directory, configuration, &local_modules);
-        let backend = configuration.backend.as_ref();
-
+    for directory in &directories {
+        let evidence = discovery::classify(directory.path, &directory.outline, &local_modules);
+        let backend = directory.outline.backend.as_ref();
         writer.put_root(&NewRoot {
-            id: &id,
-            repository: &repository.key,
-            relative_path: &relative_path,
-            directory,
+            id: &directory.id,
+            repository: &directory.repository.key,
+            relative_path: &directory.relative_path,
+            directory: directory.path,
             evidence,
             backend,
+            has_provider: directory.outline.has_provider,
+            fingerprint: directory.fingerprint.as_deref(),
             indexed_at: &indexed_at,
         })?;
-        writer.replace_configuration(&id, configuration)?;
-        index_states(&writer, &id, directory, backend)?;
+        if let Some(configuration) = &directory.configuration {
+            writer.replace_configuration(&directory.id, configuration)?;
+            report
+                .parse_fallbacks
+                .extend(configuration.fallbacks.iter().cloned());
+        } else {
+            report.unchanged_directories += 1;
+        }
+        // States change without the configuration changing, so they are
+        // looked at whether or not the directory was read.
+        index_states(&writer, &directory.id, directory.path, backend)?;
 
         report.count(evidence.classification());
-        report
-            .parse_fallbacks
-            .extend(configuration.fallbacks.iter().cloned());
-        indexed_roots.insert(id);
+        indexed_roots.insert(directory.id.clone());
     }
     report.pruned_roots = writer.prune(&bases, &indexed_roots)?;
     writer.commit()?;
@@ -173,27 +193,61 @@ fn preference(repository: &Repository) -> (bool, &Utf8Path) {
     (repository.is_linked_worktree, &repository.checkout)
 }
 
-/// Read the configuration of each directory, in parallel and in order.
-fn read_configurations(directories: &[(&Utf8Path, &Repository)]) -> Vec<Configuration> {
-    directories
-        .par_iter()
-        .map(|(directory, _)| config::read(directory))
-        .collect()
+/// A directory to index.
+#[derive(Debug)]
+struct ScannedDirectory<'a> {
+    path: &'a Utf8Path,
+    repository: &'a Repository,
+    /// Path inside the repository, `.` for its top level.
+    relative_path: String,
+    id: RootId,
+    outline: Outline,
+    /// The fingerprint to record: `None` when the directory has to be read
+    /// again by the next scan.
+    fingerprint: Option<String>,
+    /// What the directory declares. `None` when the directory is unchanged
+    /// since the previous scan, and what the index holds stays as it is.
+    configuration: Option<Configuration>,
 }
 
-/// Every directory that some configuration calls as a local module.
-fn local_modules(
-    directories: &[(&Utf8Path, &Repository)],
-    configurations: &[Configuration],
-) -> HashSet<Utf8PathBuf> {
+/// Read the configuration of each directory that changed since `known` was
+/// recorded, in parallel and in order.
+fn read_directories<'a>(
+    directories: &[(&'a Utf8Path, &'a Repository)],
+    known: &HashMap<RootId, KnownDirectory>,
+) -> Vec<ScannedDirectory<'a>> {
     directories
-        .iter()
-        .zip(configurations)
-        .flat_map(|((directory, _), configuration)| {
-            configuration
-                .module_calls
-                .iter()
-                .filter_map(|call| discovery::local_module_directory(directory, call))
+        .par_iter()
+        .map(|&(path, repository)| {
+            let relative_path =
+                paths::relative_to(path, &repository.checkout).unwrap_or_else(|| ".".to_owned());
+            let id = RootId::derive(&repository.key, &relative_path);
+            // The fingerprint is taken before the files are read: a file that
+            // changes in between is then read again by the next scan.
+            let fingerprint = config::fingerprint(path);
+            let unchanged = known.get(&id).filter(|known| {
+                // The identity of a directory does not say where it is, and
+                // module sources are resolved against its location.
+                known.path == path && Some(&known.fingerprint) == fingerprint.as_ref()
+            });
+            let (outline, fingerprint, configuration) = if let Some(known) = unchanged {
+                (known.outline.clone(), fingerprint, None)
+            } else {
+                let configuration = config::read(path);
+                // A file with a syntax error is reported by every scan until
+                // it is fixed.
+                let fingerprint = fingerprint.filter(|_| configuration.fallbacks.is_empty());
+                (configuration.outline(), fingerprint, Some(configuration))
+            };
+            ScannedDirectory {
+                path,
+                repository,
+                relative_path,
+                id,
+                outline,
+                fingerprint,
+                configuration,
+            }
         })
         .collect()
 }
