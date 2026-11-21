@@ -4,10 +4,13 @@ use camino::Utf8PathBuf;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::git::{self, Commit};
 use crate::identity::RootId;
-use crate::index::{Index, ModuleCallRow, ResourceRow, StateRow};
+use crate::index::{
+    Direction, Index, ModuleCallRow, ModuleEdge, PlanRow, ReferenceRow, RelatedAddress,
+    RelatedDirectory, ResourceRow, StateRow,
+};
 use crate::remote;
 use crate::state::StateLocation;
 
@@ -27,6 +30,8 @@ pub(crate) struct Inspection {
     pub(crate) resources: Vec<ResourceRow>,
     pub(crate) module_calls: Vec<ModuleCallRow>,
     pub(crate) states: Vec<StateRow>,
+    /// The outcome of the last `tfex plan` of each kind, per workspace.
+    pub(crate) plans: Vec<PlanRow>,
     /// The latest commit that touched the directory.
     pub(crate) last_commit: Option<Commit>,
 }
@@ -39,6 +44,7 @@ pub(crate) fn inspect(index: &Index, selector: &str) -> Result<Inspection> {
         resources: index.resources(&root.id)?,
         module_calls: index.module_calls(&root.id)?,
         states: index.states(&root.id)?,
+        plans: index.plans(&root.id)?,
         last_commit,
         id: root.id,
         repository: root.repository,
@@ -56,6 +62,74 @@ pub(crate) fn inspect(index: &Index, selector: &str) -> Result<Inspection> {
 pub(crate) fn log(index: &Index, selector: &str, limit: u32) -> Result<Vec<Commit>> {
     let root = index.find_root(selector)?;
     Ok(git::history(&root.checkout, &root.relative_path, limit))
+}
+
+/// What one Terraform directory depends on, what depends on it, and how its
+/// declarations refer to each other.
+#[derive(Debug, Serialize)]
+pub(crate) struct Graph {
+    pub(crate) id: RootId,
+    pub(crate) repository: String,
+    pub(crate) relative_path: String,
+    pub(crate) path: Utf8PathBuf,
+    pub(crate) classification: String,
+    /// The module calls made from the directory.
+    pub(crate) module_calls: Vec<ModuleEdge>,
+    /// The directories it calls as modules, directly or through others.
+    pub(crate) depends_on: Vec<RelatedDirectory>,
+    /// The directories that call it as a module, directly or through others.
+    pub(crate) dependents: Vec<RelatedDirectory>,
+    /// The references between its declarations.
+    pub(crate) references: Vec<ReferenceRow>,
+}
+
+/// `graph <root>`: the module calls and references of a directory.
+pub(crate) fn graph(index: &Index, selector: &str) -> Result<Graph> {
+    let root = index.find_root(selector)?;
+    Ok(Graph {
+        module_calls: index.module_edges(Some(&root.id))?,
+        depends_on: index.related_directories(&root.id, Direction::DependsOn)?,
+        dependents: index.related_directories(&root.id, Direction::Dependents)?,
+        references: index.references(&root.id)?,
+        id: root.id,
+        repository: root.repository,
+        relative_path: root.relative_path,
+        path: root.path,
+        classification: root.classification,
+    })
+}
+
+/// What one declaration of a directory depends on, and what depends on it.
+#[derive(Debug, Serialize)]
+pub(crate) struct Dependencies {
+    pub(crate) root_id: RootId,
+    pub(crate) repository: String,
+    pub(crate) relative_path: String,
+    pub(crate) address: String,
+    /// What the declaration refers to, directly or through others.
+    pub(crate) depends_on: Vec<RelatedAddress>,
+    /// What refers to the declaration, directly or through others.
+    pub(crate) dependents: Vec<RelatedAddress>,
+}
+
+/// `deps <root> <address>`: what a declaration refers to and is referred to
+/// by, inside its directory.
+pub(crate) fn dependencies(index: &Index, selector: &str, address: &str) -> Result<Dependencies> {
+    let root = index.find_root(selector)?;
+    if !index.has_address(&root.id, address)? {
+        return Err(Error::AddressNotFound {
+            address: address.to_owned(),
+            root: selector.to_owned(),
+        });
+    }
+    Ok(Dependencies {
+        depends_on: index.related_addresses(&root.id, address, Direction::DependsOn)?,
+        dependents: index.related_addresses(&root.id, address, Direction::Dependents)?,
+        root_id: root.id,
+        repository: root.repository,
+        relative_path: root.relative_path,
+        address: address.to_owned(),
+    })
 }
 
 /// The states of one Terraform directory.

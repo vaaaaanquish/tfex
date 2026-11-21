@@ -1,8 +1,8 @@
 //! The `fetch` command: read states from where they are.
 //!
 //! `scan` only reads what is on the local disk. `fetch` is the explicit step
-//! that also goes to remote backends, and the only command that uses the
-//! network.
+//! that also goes to remote backends, and the only command with which tfex
+//! itself uses the network.
 
 use std::collections::HashSet;
 use std::time::Duration;

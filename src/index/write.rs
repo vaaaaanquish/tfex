@@ -14,6 +14,7 @@ use crate::discovery::Evidence;
 use crate::error::Result;
 use crate::git::Repository;
 use crate::identity::{RepoKey, RootId};
+use crate::plan::{Mode, PlanOutcome};
 use crate::state::{StateLocation, StateStatus, StateSummary};
 
 /// A Terraform directory to record.
@@ -26,6 +27,10 @@ pub(crate) struct NewRoot<'a> {
     pub(crate) directory: &'a Utf8Path,
     pub(crate) evidence: Evidence,
     pub(crate) backend: Option<&'a Backend>,
+    pub(crate) has_provider: bool,
+    /// The fingerprint of the configuration files, when the next scan may
+    /// rely on it to leave the directory unread.
+    pub(crate) fingerprint: Option<&'a str>,
     pub(crate) indexed_at: &'a str,
 }
 
@@ -95,9 +100,11 @@ impl Writer<'_> {
         self.transaction
             .prepare_cached(
                 "INSERT INTO roots (id, repo_key, relative_path, abs_path, classification,
-                                    reason, backend_type, backend_config, indexed_at)
+                                    reason, backend_type, backend_config, has_provider,
+                                    fingerprint, indexed_at)
                  VALUES (:id, :repo_key, :relative_path, :abs_path, :classification,
-                         :reason, :backend_type, :backend_config, :indexed_at)
+                         :reason, :backend_type, :backend_config, :has_provider,
+                         :fingerprint, :indexed_at)
                  ON CONFLICT (id) DO UPDATE SET
                      repo_key = excluded.repo_key,
                      relative_path = excluded.relative_path,
@@ -106,6 +113,8 @@ impl Writer<'_> {
                      reason = excluded.reason,
                      backend_type = excluded.backend_type,
                      backend_config = excluded.backend_config,
+                     has_provider = excluded.has_provider,
+                     fingerprint = excluded.fingerprint,
                      indexed_at = excluded.indexed_at",
             )?
             .execute(named_params! {
@@ -117,12 +126,15 @@ impl Writer<'_> {
                 ":reason": root.evidence.reason(),
                 ":backend_type": backend_type,
                 ":backend_config": backend_config,
+                ":has_provider": root.has_provider,
+                ":fingerprint": root.fingerprint,
                 ":indexed_at": root.indexed_at,
             })?;
         Ok(())
     }
 
-    /// Replace the resources and module calls recorded for `root`.
+    /// Replace the resources, module calls and references recorded for
+    /// `root`.
     pub(crate) fn replace_configuration(
         &self,
         root: &RootId,
@@ -133,6 +145,9 @@ impl Writer<'_> {
             .execute([root])?;
         self.transaction
             .prepare_cached("DELETE FROM module_calls WHERE root_id = ?1")?
+            .execute([root])?;
+        self.transaction
+            .prepare_cached("DELETE FROM dependencies WHERE root_id = ?1")?
             .execute([root])?;
 
         // A block declared twice at the same place cannot be told apart, so
@@ -154,16 +169,31 @@ impl Writer<'_> {
         }
 
         let mut insert_module_call = self.transaction.prepare_cached(
-            "INSERT OR IGNORE INTO module_calls (root_id, name, source, file, line)
-             VALUES (:root_id, :name, :source, :file, :line)",
+            "INSERT OR IGNORE INTO module_calls (root_id, name, source, target_path, file, line)
+             VALUES (:root_id, :name, :source, :target_path, :file, :line)",
         )?;
         for call in &configuration.module_calls {
             insert_module_call.execute(named_params! {
                 ":root_id": root,
                 ":name": call.name,
                 ":source": call.source,
+                ":target_path": call.directory.as_ref().map(|directory| directory.as_str()),
                 ":file": call.file,
                 ":line": call.line,
+            })?;
+        }
+
+        let mut insert_dependency = self.transaction.prepare_cached(
+            "INSERT OR IGNORE INTO dependencies (root_id, source, target, file, line)
+             VALUES (:root_id, :source, :target, :file, :line)",
+        )?;
+        for reference in &configuration.references {
+            insert_dependency.execute(named_params! {
+                ":root_id": root,
+                ":source": reference.from,
+                ":target": reference.to,
+                ":file": reference.file,
+                ":line": reference.line,
             })?;
         }
         Ok(())
@@ -271,6 +301,40 @@ impl Writer<'_> {
         {
             delete.execute((root, workspace))?;
         }
+        Ok(())
+    }
+
+    /// Record the outcome of planning `workspace` of `root`, replacing that
+    /// of the previous plan of the same kind.
+    pub(crate) fn put_plan(
+        &self,
+        root: &RootId,
+        workspace: &str,
+        mode: Mode,
+        outcome: &PlanOutcome,
+    ) -> Result<()> {
+        self.transaction
+            .prepare_cached(
+                "INSERT OR REPLACE INTO plans
+                     (root_id, workspace, mode, status, terraform_version, to_add, to_change,
+                      to_remove, to_import, drifted, planned_at, error)
+                 VALUES (:root_id, :workspace, :mode, :status, :terraform_version, :to_add,
+                         :to_change, :to_remove, :to_import, :drifted, :planned_at, :error)",
+            )?
+            .execute(named_params! {
+                ":root_id": root,
+                ":workspace": workspace,
+                ":mode": mode.as_str(),
+                ":status": outcome.status.as_str(),
+                ":terraform_version": outcome.terraform_version,
+                ":to_add": outcome.add,
+                ":to_change": outcome.change,
+                ":to_remove": outcome.remove,
+                ":to_import": outcome.import,
+                ":drifted": outcome.drift.len(),
+                ":planned_at": outcome.planned_at,
+                ":error": outcome.error,
+            })?;
         Ok(())
     }
 

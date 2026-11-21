@@ -8,14 +8,16 @@ need quick answers to questions such as:
 - Which directories are roots, and which are reusable modules?
 - What is known about each root's state?
 - What changed in this root recently?
+- Which roots use this module, and what refers to this resource?
+- What would Terraform change here, and what has drifted?
 
 `tfex scan` walks directory trees once and stores what it finds in a SQLite
 file. Every other command answers from that file in milliseconds and prints
 JSON.
 
-tfex never runs Terraform and never writes anywhere except its own index.
-Nothing touches the network unless you run `tfex fetch`, which reads state
-metadata from remote backends.
+tfex writes nowhere except its own index, and does nothing behind your back:
+the network is only used by `tfex fetch`, which reads state metadata from
+remote backends, and Terraform is only run by `tfex plan`.
 
 ## Install
 
@@ -28,6 +30,7 @@ tfex uses these tools when they are installed, and degrades when they are not:
 | `git` | repository identity and history |
 | `gcloud` | `tfex fetch` of states in Google Cloud Storage |
 | `aws` | `tfex fetch` of states in Amazon S3 |
+| `terraform` or `tofu` | `tfex plan` |
 
 ```bash
 cargo install --git https://github.com/vaaaaanquish/tfex
@@ -39,6 +42,7 @@ cargo install --git https://github.com/vaaaaanquish/tfex
 # Index one or more directory trees: repositories, monorepos, or folders
 # that are not under Git at all.
 tfex scan ~/work/infra ~/work/services
+tfex scan --full ~/work/infra             # read again what looks unchanged
 
 tfex roots                                # roots only
 tfex roots --all                          # ... and reusable modules
@@ -49,8 +53,15 @@ tfex log infra/envs/prod --limit 5        # commits that touched the root
 tfex status                               # state of every workspace
 tfex status infra/envs/prod
 
+tfex graph                                # every module call, and what it resolves to
+tfex graph infra/modules/network          # who uses it, what it uses, references inside
+tfex deps infra/envs/prod aws_vpc.main    # what it depends on, what depends on it
+
 tfex fetch                                # read state metadata, remote backends included
 tfex fetch infra/envs/prod
+
+tfex plan infra/envs/prod                 # run terraform plan: what would change
+tfex plan --refresh-only infra/envs/prod  # ... or what has drifted
 ```
 
 A root can be named by its ID from `tfex roots` (or a unique prefix of it),
@@ -177,6 +188,139 @@ tfex map-state infra/envs/prod gs://my-bucket/prod/default.tfstate
 A mapping survives rescans and takes precedence over what the root itself
 says.
 
+### Dependencies
+
+Two kinds of dependency are indexed, both read from the configuration
+without evaluating it.
+
+**Between directories**: a `module` block whose `source` is a local path
+makes the calling directory depend on the called one. `tfex graph` lists
+every module call with the directory it resolves to (`target` is `null` for
+registry and Git modules, and for directories that are not indexed).
+`tfex graph <root>` follows the calls both ways, through any number of
+modules, which answers "which roots do I have to plan after changing this
+module?":
+
+```console
+$ tfex graph infra/modules/network
+{
+  "id": "9b1d6f0c2a77",
+  "repository": "infra",
+  "relative_path": "modules/network",
+  ...
+  "depends_on": [],
+  "dependents": [
+    {
+      "root_id": "5c0e8a1f3d42",
+      "repository": "infra",
+      "relative_path": "modules/app",
+      "classification": "module",
+      "depth": 1
+    },
+    {
+      "root_id": "3f6c0a9d2b1e",
+      "repository": "infra",
+      "relative_path": "envs/prod",
+      "classification": "confirmed",
+      "depth": 2
+    }
+  ],
+  "references": [...]
+}
+```
+
+**Inside a directory**: an expression that mentions another declaration
+makes its own declaration depend on it. Resources, data sources, module
+calls, local values and outputs refer; all of those except outputs, and
+input variables, are referred to. `tfex graph <root>` lists each reference
+once, with the file and line of its first occurrence, and `tfex deps`
+follows them from one address:
+
+```console
+$ tfex deps infra/envs/prod module.app
+{
+  "root_id": "3f6c0a9d2b1e",
+  "repository": "infra",
+  "relative_path": "envs/prod",
+  "address": "module.app",
+  "depends_on": [
+    { "address": "data.aws_ami.latest", "depth": 1 },
+    { "address": "local.name", "depth": 1 },
+    { "address": "var.region", "depth": 2 }
+  ],
+  "dependents": [
+    { "address": "aws_route53_record.app", "depth": 1 },
+    { "address": "output.record", "depth": 2 }
+  ]
+}
+```
+
+`depth` is the number of calls or references in between: 1 is direct.
+
+### Plans and drift
+
+`tfex plan <root>...` runs `terraform plan` in each root and reports which
+resource instances would be created, updated, replaced or deleted. With
+`--refresh-only` it runs `terraform plan -refresh-only` instead, which
+compares the state with the real infrastructure: that is drift detection.
+
+```console
+$ tfex plan --refresh-only infra/envs/prod
+{
+  "planned": 1,
+  "failed": 0,
+  "plans": [
+    {
+      "repository": "infra",
+      "root_id": "3f6c0a9d2b1e",
+      "relative_path": "envs/prod",
+      "workspace": "default",
+      "mode": "refresh-only",
+      "status": "drift",
+      "terraform_version": "1.9.0",
+      "add": 0,
+      "change": 0,
+      "remove": 0,
+      "import": 0,
+      "changes": [],
+      "drift": [
+        { "address": "aws_s3_bucket.logs", "action": "update" }
+      ],
+      "planned_at": "2026-01-02T03:04:05Z",
+      "error": null
+    }
+  ]
+}
+```
+
+| Status | Meaning |
+|---|---|
+| `no_changes` | nothing to apply; for `--refresh-only`, nothing drifted |
+| `changes` | applying the configuration would change something (listed in `changes`) |
+| `drift` | `--refresh-only` found resources changed outside Terraform (listed in `drift`) |
+| `error` | Terraform could not make the plan; `error` says why |
+
+A plain plan lists drift too, but only the drift Terraform considers
+relevant to what it plans; use `--refresh-only` to see all of it.
+
+This is the one command that runs Terraform, and it is as unobtrusive as a
+plan can be:
+
+- It runs in the root as it is. tfex does not run `terraform init`; a root
+  that is not initialized is an `error` on that plan.
+- The state is not locked (`-lock=false`), so a plan never makes somebody
+  else's apply wait. No plan file is saved.
+- Terraform runs with the credentials and environment of your shell, in the
+  workspace selected in the root unless `--workspace` (or `TF_WORKSPACE`)
+  names another.
+- `--terraform tofu` (or `TFEX_TERRAFORM`) runs another program;
+  `--timeout` bounds each plan (600 seconds by default).
+
+Only addresses, actions and counts are read from Terraform's output; planned
+values are never stored or printed. The summary of the last plan of each
+kind is kept, and shown by `tfex inspect` under `plans` with `planned_at`
+telling how old it is.
+
 ### Repositories and checkouts
 
 A root is identified by its repository (the `origin` remote, or the location
@@ -195,15 +339,28 @@ directory.
 ### Rescanning
 
 `tfex scan` replaces what the index holds for the scanned paths: directories
-that disappeared are pruned (with their state mappings), and everything
-outside the scanned paths is left alone.
+that disappeared are pruned (with their state mappings and plans), and
+everything outside the scanned paths is left alone.
+
+A rescan is incremental. A directory whose `.tf` and `.tf.json` files have
+the names, sizes and modification times the previous scan found is not read
+again (`unchanged_directories` in the report); its classification and its
+local states are still brought up to date. `tfex scan --full` reads
+everything regardless. A file modified in the last two seconds is never
+trusted to be unchanged, nor is a directory with a file that has a syntax
+error.
 
 ## Security
 
 - Read-only: tfex reads files and runs a few read-only Git commands
-  (`rev-parse`, `remote get-url`, `log`). It does not run `terraform`.
-- No network access, except for `tfex fetch`, which only downloads state
-  objects, and only through `gcloud` and `aws`.
+  (`rev-parse`, `remote get-url`, `log`). It runs `terraform` only for
+  `tfex plan`, and then only `terraform plan`, without locking the state or
+  saving a plan.
+- No network access of its own, except for `tfex fetch`, which only
+  downloads state objects, and only through `gcloud` and `aws`. During
+  `tfex plan`, Terraform and its providers talk to whatever they talk to.
+- Plan values are never kept: of Terraform's output, only resource
+  addresses, actions, counts and the one-line summary of an error are read.
 - State values are never kept (see [State](#state)). A fetched state is held
   in memory just long enough to count its resources; it is not written to
   disk.
@@ -217,8 +374,12 @@ subjects and HCL identifiers come from whatever was scanned.
 
 ## Limitations
 
-- Nothing is known about live infrastructure: no plan, no drift detection. A
-  state says what Terraform last recorded, not what exists.
+- Live infrastructure is only looked at by `tfex plan`, one root at a time
+  and only when asked. A state says what Terraform last recorded, not what
+  exists, and a recorded plan says what was true at `planned_at`.
+- `tfex plan` needs roots that are already initialized, and passes no
+  `-var` or `-var-file`: variables without defaults must come from
+  `*.auto.tfvars` files or `TF_VAR_*` environment variables.
 - Only `gcs` and `s3` states can be fetched. For a remote backend only the
   default workspace is located automatically.
 - Configuration is read shallowly. Expressions are not evaluated, so `count`
@@ -226,8 +387,14 @@ subjects and HCL identifiers come from whatever was scanned.
   string literal is not followed. Registry and Git modules are not resolved.
 - A file with a syntax error is indexed on a best-effort basis and listed in
   the scan report under `parse_fallbacks`.
-- Declarations in `.tf.json` files are all reported on line 1.
-- Every scan re-reads everything; there is no incremental indexing.
+- References are found by the shape of expressions and kept when they name
+  something the directory declares. They stop at module boundaries:
+  `module.app.address` is a reference to `module.app`, not to the output
+  inside the module. A file with a syntax error contributes none.
+- Declarations and references in `.tf.json` files are all reported on
+  line 1.
+- An incremental scan trusts sizes and modification times; a change that
+  preserves both goes unnoticed until `tfex scan --full`.
 
 ## Development
 

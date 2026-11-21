@@ -23,6 +23,9 @@ pub(crate) enum Error {
     #[error("Ambiguous root: {0}; use its ID")]
     AmbiguousRoot(String),
 
+    #[error("Nothing in {root} is declared or referred to as {address}; see 'graph {root}'")]
+    AddressNotFound { address: String, root: String },
+
     #[error("Unsupported state URI scheme: {0}")]
     UnsupportedStateScheme(String),
 
@@ -72,6 +75,7 @@ impl Error {
             Error::NotADirectory(_) => "not_a_directory",
             Error::RootNotFound(_) => "root_not_found",
             Error::AmbiguousRoot(_) => "ambiguous_root",
+            Error::AddressNotFound { .. } => "address_not_found",
             Error::UnsupportedStateScheme(_) => "unsupported_state_scheme",
             Error::IndexLocationUnknown => "index_location_unknown",
             Error::IncompatibleIndex { .. } => "incompatible_index",

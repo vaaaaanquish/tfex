@@ -6,8 +6,8 @@ use std::sync::mpsc;
 use camino::{Utf8Path, Utf8PathBuf};
 use ignore::{DirEntry, WalkBuilder, WalkState};
 
-use crate::config::{self, Configuration, ModuleCall};
-use crate::{paths, state};
+use crate::config::{self, Outline};
+use crate::state;
 
 /// Directories that are never descended into: version control data,
 /// dependency caches, and Terraform's own working directories.
@@ -152,37 +152,29 @@ impl Evidence {
     }
 }
 
-/// Judge `directory` from its configuration, its files, and the set of
-/// directories that other configurations call as local modules.
+/// Judge `directory` from the outline of its configuration, its files, and
+/// the set of directories that other configurations call as local modules.
 ///
 /// Owning a state outweighs being called as a module, which in turn outweighs
 /// merely looking like a root.
 pub(crate) fn classify(
     directory: &Utf8Path,
-    configuration: &Configuration,
-    local_modules: &HashSet<Utf8PathBuf>,
+    outline: &Outline,
+    local_modules: &HashSet<&Utf8Path>,
 ) -> Evidence {
-    if configuration.backend.is_some() {
+    if outline.backend.is_some() {
         Evidence::BackendDeclared
     } else if state::has_local_state(directory) {
         Evidence::LocalStateFound
     } else if local_modules.contains(directory) {
         Evidence::ReferencedAsLocalModule
-    } else if configuration.has_provider {
+    } else if outline.has_provider {
         Evidence::ProviderDeclared
-    } else if !configuration.resources.is_empty() || !configuration.module_calls.is_empty() {
+    } else if outline.declares_infrastructure {
         Evidence::DeclaresInfrastructure
     } else {
         Evidence::Nothing
     }
-}
-
-/// The directory that `call`, made from `caller`, refers to when its source
-/// is a local path (`./...` or `../...`).
-pub(crate) fn local_module_directory(caller: &Utf8Path, call: &ModuleCall) -> Option<Utf8PathBuf> {
-    let source = call.source.as_deref()?;
-    let is_local = source.starts_with("./") || source.starts_with("../");
-    is_local.then(|| paths::canonical(&caller.join(source)))
 }
 
 #[cfg(test)]
@@ -192,6 +184,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::paths;
 
     fn canonical_root(directory: &TempDir) -> Utf8PathBuf {
         paths::resolve(Utf8Path::from_path(directory.path()).unwrap()).unwrap()
@@ -261,51 +254,32 @@ mod tests {
     fn evidence_is_ranked() {
         let directory = TempDir::new().unwrap();
         let root = canonical_root(&directory);
-        let called: HashSet<Utf8PathBuf> = [root.clone()].into();
+        let called: HashSet<&Utf8Path> = [root.as_path()].into();
         let nothing_called = HashSet::new();
-        let mut configuration = Configuration::default();
+        let mut outline = Outline::default();
 
         assert_eq!(
-            classify(&root, &configuration, &nothing_called),
+            classify(&root, &outline, &nothing_called),
             Evidence::Nothing
         );
-        configuration.has_provider = true;
+        outline.declares_infrastructure = true;
         assert_eq!(
-            classify(&root, &configuration, &nothing_called),
+            classify(&root, &outline, &nothing_called),
+            Evidence::DeclaresInfrastructure
+        );
+        outline.has_provider = true;
+        assert_eq!(
+            classify(&root, &outline, &nothing_called),
             Evidence::ProviderDeclared
         );
         assert_eq!(
-            classify(&root, &configuration, &called),
+            classify(&root, &outline, &called),
             Evidence::ReferencedAsLocalModule
         );
         touch(&root.join("terraform.tfstate"));
         assert_eq!(
-            classify(&root, &configuration, &called),
+            classify(&root, &outline, &called),
             Evidence::LocalStateFound
         );
-    }
-
-    #[test]
-    fn only_relative_sources_are_local_modules() {
-        let caller = Utf8Path::new("/nonexistent-tfex/envs/prod");
-        let call = |source: Option<&str>| ModuleCall {
-            name: "m".to_owned(),
-            source: source.map(str::to_owned),
-            file: "main.tf".to_owned(),
-            line: 1,
-        };
-        assert_eq!(
-            local_module_directory(caller, &call(Some("../../modules/network"))).unwrap(),
-            "/nonexistent-tfex/modules/network"
-        );
-        assert_eq!(
-            local_module_directory(caller, &call(Some("./child"))).unwrap(),
-            "/nonexistent-tfex/envs/prod/child"
-        );
-        assert_eq!(
-            local_module_directory(caller, &call(Some("hashicorp/vpc/aws"))),
-            None
-        );
-        assert_eq!(local_module_directory(caller, &call(None)), None);
     }
 }
