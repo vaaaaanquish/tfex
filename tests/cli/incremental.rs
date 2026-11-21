@@ -24,7 +24,12 @@ fn snapshot(workspace: &Workspace) -> Value {
         .map(|root| {
             let mut inspection = workspace.tfex(&["inspect", root["id"].as_str().unwrap()]);
             let graph = workspace.tfex(&["graph", root["id"].as_str().unwrap()]);
+            // When the index and the local states were last read is the
+            // time of the scan, not something a scan finds.
             inspection["indexed_at"].take();
+            for state in inspection["states"].as_array_mut().unwrap() {
+                state["fetched_at"].take();
+            }
             json!([inspection, graph])
         })
         .collect();
